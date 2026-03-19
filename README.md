@@ -68,7 +68,7 @@ Both weights remain configurable.
 
 ---
 
-## 4. Elo Calculation (Unchanged Structure)
+## 4. Elo Calculation
 
 ### 4.1 Expected Result
 
@@ -80,13 +80,19 @@ Where `dr` is the Elo rating difference between the two teams (or leagues, for L
 
 ### 4.2 Elo Update
 
+Elo is updated at the **series level**, not the individual game level. The series winner (team with the majority of game wins) is treated as W = 1; the loser as W = 0.
+
 ```
 P_after = P_before + K_effective × (W − We)
 ```
 
 Where:
-- `W` = match result (1 = win, 0 = loss)
+- `W` = series result (1 = series win, 0 = series loss)
 - `K_effective` = the final adjusted K-factor after applying tournament tier and temporal decay (see Sections 5 and 6)
+
+### 4.3 Series Reconstruction
+
+Oracle's Elixir CSV data provides individual game rows. Series are reconstructed by grouping games that share the same `(date, league, split, playoffs, sorted team pair)` context key. The `game` column (game number within a series) is used for ordering when present. Games on different calendar dates are never grouped into the same series.
 
 ---
 
@@ -106,7 +112,7 @@ The K-factor for international play should reflect this hierarchy rather than co
 
 | Tier | Tournaments | Description |
 |---|---|---|
-| S | Worlds | Apex annual championship |
+| S | Worlds (main event) | Apex annual championship |
 | A | MSI | Mid-season major invitational |
 | B | First Stand, other multi-region invitationals | Smaller international events |
 | Regional | All domestic league play | LCK, LPL, LEC, LCS, etc. |
@@ -129,22 +135,28 @@ These values are starting parameters and should be tuned as data accumulates.
 
 ### 5.4 Assigning Tournament Tier from Oracle's Elixir Data
 
-Oracle's Elixir identifies tournaments via the `league` field. The mapping is:
+Oracle's Elixir identifies tournaments via the `league` field. The canonicalization function uses exact dictionary lookup first, then falls back to substring matching to handle variants like `"LoL Worlds 2024"` or `"Mid-Season Invitational"`:
 
 ```python
-TOURNAMENT_TIERS = {
-    # Tier S
-    "WLDs": "S",
-    "Worlds": "S",
-    # Tier A
-    "MSI": "A",
-    # Tier B
-    "First Stand": "B",
-    # All other values → Regional
+# Exact lookup
+LEAGUE_CANON = {
+    'worlds': 'Worlds', 'wlds': 'Worlds', 'lol worlds': 'Worlds',
+    'msi': 'MSI', 'mid-season invitational': 'MSI',
+    'first stand': 'First Stand',
+    ...
 }
+
+# Substring fallback
+if 'world' in s: return 'Worlds'
+if 'msi'   in s: return 'MSI'
+if 'first stand' in s: return 'First Stand'
 ```
 
-The `playoffs` column (0 or 1) distinguishes playoff games from group/regular stage games. The `league` field in combination with `playoffs` and contextual parsing of `split` provides everything needed to assign a tier and stage.
+The `playoffs` column (0 or 1) distinguishes playoff games from group/regular stage games.
+
+### 5.5 Worlds Regional Qualifier Treatment
+
+Oracle's Elixir tags Worlds regional qualifier games (the play-in stage held before the main event begins) under the same `league` value as the main event. These games are **not** Tier S competition — they are regional teams competing for a slot, similar in stakes to a domestic playoff. The model detects qualifier games by comparing the game date against a known main-event start date per year, and reclassifies them as `tier = 'regional'` with a league multiplier drawn from the qualifying team's home region.
 
 ---
 
@@ -161,15 +173,15 @@ decay(t) = e^(−λ × t)
 ```
 
 Where:
-- `t` = time elapsed since the match, measured in **months**
+- `t` = time elapsed since the series, measured in **months**
 - `λ` = decay rate constant
 - `e` = Euler's number (~2.718)
 
-The effective K-factor for any match becomes:
+The effective K-factor for any series becomes:
 
 ```
 K_effective = K_base × decay(t)
-              = K_base × e^(−λ × t)
+            = K_base × e^(−λ × t)
 ```
 
 ### 6.3 Choosing λ — The Half-Life Parameter
@@ -183,45 +195,54 @@ The decay rate is most intuitively expressed as a **half-life**: the age at whic
 | Half-Life | λ Value | Character |
 |---|---|---|
 | 6 months | 0.1155 | Very aggressive — one split matters most |
-| 12 months | 0.0578 | Moderate — approximately one competitive year |
-| 18 months | 0.0385 | Conservative — closer to Riot's current behavior |
-
-**Default recommendation: 12-month half-life (λ = 0.0578)**
+| **8 months** | **0.0866** | **Default — recent domestic form dominates stale international results** |
+| 12 months | 0.0578 | Conservative — closer to Riot's current behavior |
+| 18 months | 0.0385 | Very conservative — sustained historical record weighted heavily |
+**Default recommendation: 8-month half-life (λ = 0.0866)**
 
 This means:
 - A result from today contributes 100% of its Elo delta
-- A result from 12 months ago contributes ~50%
-- A result from 24 months ago contributes ~25%
+- A result from 8 months ago contributes ~50%
+- A result from 12 months ago contributes ~35%
+- A result from 24 months ago contributes ~13%
 
-Under this setting, First Stand 2025 (approximately 12–15 months old at time of a March 2026 ranking) would contribute ~40–47% of its original Elo delta — still meaningful, but no longer capable of overriding a team's entire current-season performance.
+Under this setting, First Stand 2025 (approximately 12 months old at time of a March 2026 ranking) contributes only ~35% of its original Elo delta. A recent LCK Cup 2026 playoff series (~2 months old) retains ~84% of its delta — meaning current domestic form decisively outweighs stale international results, which is the intended behavior.
+
+A 6-month half-life is also valid if even more aggressive recency weighting is desired; at that setting a 12-month-old result contributes only ~25%. A 12-month half-life is available for users who prefer a more conservative, historically-weighted ranking.
 
 ### 6.4 Interaction with Tournament Tiers
 
-Decay and tier multipliers stack multiplicatively. A Worlds 2024 playoff result (K = 48 base) evaluated in March 2026 (~17 months later) with λ = 0.0578:
+Decay and tier multipliers stack multiplicatively. All examples below use the default λ = 0.0866 (8-month half-life).
+
+A Worlds 2024 playoff result (K = 48 base) evaluated in March 2026 (~17 months later):
 
 ```
-K_effective = 48 × e^(−0.0578 × 17) ≈ 48 × 0.373 ≈ 17.9
+K_effective = 48 × e^(−0.0866 × 17) ≈ 48 × 0.228 ≈ 10.9
 ```
 
 A First Stand 2025 playoff result (K = 24 base) evaluated in March 2026 (~12 months later):
 
 ```
-K_effective = 24 × e^(−0.0578 × 12) ≈ 24 × 0.500 ≈ 12.0
+K_effective = 24 × e^(−0.0866 × 12) ≈ 24 × 0.353 ≈ 8.5
 ```
 
-Compare: A LCK Winter 2026 playoff result (K = 20 base) played in January 2026 (~2 months ago):
+A LCK Cup 2026 playoff result (K = 20 base) played in February 2026 (~1 month ago):
 
 ```
-K_effective = 20 × e^(−0.0578 × 2) ≈ 20 × 0.891 ≈ 17.8
+K_effective = 20 × e^(−0.0866 × 1) ≈ 20 × 0.917 ≈ 18.3
 ```
 
-This illustrates the correct behavior: a very recent domestic playoff result now carries roughly the same weight as a tiered-and-decayed international result from 17 months ago, rather than being vastly overshadowed by it.
+A LCK Cup 2026 regular season result (K = 8 × 1.15 = 9.2 base) played in January 2026 (~2 months ago):
+
+```
+K_effective = 9.2 × e^(−0.0866 × 2) ≈ 9.2 × 0.841 ≈ 7.7
+```
+
+At this setting, a single recent LCK Cup playoff series (K_eff ≈ 18.3) is worth more than two First Stand playoff series from 12 months ago combined (K_eff ≈ 8.5 each). This directly resolves the HLE-over-BLG symptom: a team's current domestic playoff form now clearly dominates their year-old international results.
 
 ---
 
 ## 7. Evaluation Windows
-
-Following the original model's approach, with slight adjustment to align with the decay function:
 
 | Component | Window |
 |---|---|
@@ -234,9 +255,13 @@ Because decay reduces the influence of old results continuously, the hard window
 
 ## 8. League Elo Updates from International Play
 
-League Elo continues to be updated when teams play internationally, using the same tiered K-factors applied to the corresponding league's rating rather than the individual team's. This preserves the original model's insight that inter-regional matchups reveal regional strength.
+League Elo is updated when teams from different home regions compete at an international event (Worlds main event, MSI, First Stand). The same tiered K-factor and temporal decay are applied, but at half weight (× 0.5) to avoid league Elo drifting too aggressively from individual series results:
 
-The league-level decay is applied using the same λ parameter, consistent with Team Elo treatment.
+```
+K_league = K_base × decay(t) × 0.5
+```
+
+Worlds regional qualifier games are excluded from League Elo updates, consistent with their reclassification as regional-tier events.
 
 ---
 
@@ -246,86 +271,111 @@ The league-level decay is applied using the same λ parameter, consistent with T
 |---|---|
 | Starting Team Elo | 1500 |
 | Starting League Elo | 1500 |
-| Minimum matches before ranking | 5 |
+| Minimum games before ranking | 5 |
 
-Teams with fewer than 5 recorded matches in the evaluation window are marked as unranked to avoid noise from extremely small samples.
+Teams with fewer than 5 recorded games in the evaluation window are excluded from the ranked output.
 
 ---
 
 ## 10. Regional K-Factor Scaling
 
-Following Riot's approach, regional K-factors are scaled to align with each league's historical international performance. This prevents a dominant region from being under-represented simply because their intra-regional Elo ceiling is lower due to internal competition depth.
+Regional K-factors are scaled by a league multiplier to account for differences in intra-regional competition depth. This prevents a dominant region from being under-represented simply because their internal Elo ceiling is lower due to stronger competition.
 
-The implementation scales regional K by a `league_multiplier` derived from average historical Worlds/MSI placement:
-
-| League | Multiplier (example) |
+| League | Multiplier |
 |---|---|
 | LCK | 1.15 |
 | LPL | 1.15 |
-| LEC | 1.05 |
+| LEC | 1.10 |
 | LCS | 1.00 |
-| PCS, VCS, CBLoL, etc. | 0.90 |
+| LCP | 0.95 |
+| CBLoL | 0.90 |
 
 These multipliers should be recalibrated annually based on updated international placement data.
 
 ---
 
-## 11. Data Pipeline — Oracle's Elixir CSV
+## 11. Ranking Eligibility
 
-### 11.1 Required Columns
+To appear in the final ranked output, a team must satisfy all three conditions:
+
+1. **Minimum games:** At least 5 games recorded in the evaluation window
+2. **Home region:** The team must have a resolved home league (LCK, LPL, LEC, LCS, LCP, or CBLoL)
+3. **Anchor-year activity:** The team must have appeared in a Tier 1 domestic league during the anchor year (the year of the most recent data point). Teams that disbanded, were relegated, or are otherwise inactive in the current season are excluded.
+
+---
+
+## 12. International Event Placement Estimation
+
+Oracle's Elixir CSV data does not include a placement column. Placement is estimated from each team's series record within a given tournament instance using the following heuristic:
+
+| Condition | Estimated Placement |
+|---|---|
+| Won the tournament's final series | Champion |
+| Lost the tournament's final series | Runner-Up |
+| 2+ series wins, did not reach final | 3rd / 4th |
+| 1 series win | 5th – 8th |
+| 0 series wins, 2+ series losses | 9th – 16th |
+| 0 series wins, 1 series loss | Play-In Exit |
+
+The Champion and Runner-Up placements are determined precisely by tracking which team won and lost the last series played in each tournament. All other placements are bracket-depth estimates based on series wins accumulated.
+
+---
+
+## 13. Data Pipeline — Oracle's Elixir CSV
+
+### 13.1 Required Columns
 
 From the Oracle's Elixir downloadable match data CSV, the model uses only team-level rows (where `position == "team"`):
 
 | Column | Usage |
 |---|---|
-| `gameid` | Unique match identifier |
-| `date` | Match date — used to calculate temporal decay |
+| `gameid` | Unique game identifier — used for series reconstruction |
+| `date` | Game date — used to calculate temporal decay and group series |
 | `league` | Tournament identification → tier mapping |
 | `split` | Splits within a league year |
 | `playoffs` | 0 = regular season/group stage, 1 = playoff match |
-| `team` | Team name |
+| `teamname` | Team name |
 | `result` | 1 = win, 0 = loss |
 | `year` | Year of the match |
+| `game` | Game number within a series (optional — used for series ordering when present) |
 
-### 11.2 Processing Steps
+### 13.2 Processing Steps
 
 1. Load CSV(s), filter to `position == "team"` rows only
-2. Parse `date` column to a datetime object
-3. For each match, compute `t = (today - match_date).days / 30.44` (months elapsed)
-4. Discard rows where `t > 24` (outside Team Elo window) for team calculations; `t > 36` for league calculations
-5. Map `league` to tournament tier using the tier table
-6. Map `playoffs` to stage (0 = group/regular, 1 = playoff)
-7. Process matches in chronological order (oldest first) to simulate Elo evolution correctly
-8. On each match: compute `We`, compute `K_effective = K_base × e^(−λ × t)`, update Team Elo and League Elo
+2. Canonicalize `league` field using exact lookup + substring fallback
+3. Filter out Tier 2 leagues and unknown league codes
+4. Filter out teams whose name contains academy/challenger/youth identifiers
+5. Parse `date` column; compute `t = (anchor_date - game_date).days / 30.44`
+6. Reconstruct series by grouping games on `(date, league, split, playoffs, sorted team pair)`
+7. Determine series winner (majority of game wins); flag series with tied game counts as incomplete
+8. Process series in chronological order (oldest first) to simulate Elo evolution correctly
+9. For each series: compute `We`, compute `K_effective = K_base × e^(−λt)`, update Team Elo and League Elo
 
-### 11.3 De-duplication
+### 13.3 Tier 2 Exclusion
 
-Oracle's Elixir stores each game as multiple rows (one per player + one per team). After filtering to `position == "team"`, each game still has two rows (one per team). The model processes both, updating each team's Elo independently on the same match.
-
----
-
-## 12. Output
-
-The model produces a ranked list of all teams with:
-
-- Current Power Score
-- Current Team Elo
-- Current League Elo
-- League affiliation
-- Number of matches in window
-- Δ rank and Δ Power Score vs. prior snapshot (optional)
-
-League-level rankings are also produced for regional strength comparison.
+The model is scoped to Tier 1 competition only. Leagues are excluded via both exact name matching and substring detection (e.g. "challengers", "academy", "masters"). Team names containing these tokens are also excluded as an additional guard against challenger-league teams appearing under a Tier 1 league code.
 
 ---
 
-## 13. Configurable Parameters Summary
+## 14. Output
+
+The model produces:
+
+- **Team rankings:** Power Score, Team Elo, League Elo, series record (most recent domestic split), total games in window
+- **League rankings:** League Elo, average team Elo, top team, team count
+- **International event breakdown (per team):** Event name, estimated placement, series W/L, game W/L
+- **Domestic split history (per team):** Series W/L and game W/L per split, most recent first
+- **Biggest upsets:** Series where the lower-rated team won, sorted by upset magnitude (pre-series win probability of the winner)
+
+---
+
+## 15. Configurable Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `alpha` | 0.80 | Team Elo weight in Power Score |
-| `beta` | 0.20 | League Elo weight in Power Score |
-| `half_life_months` | 12 | Temporal decay half-life |
+| `beta` | 0.20 | League Elo weight in Power Score (= 1 − alpha) |
+| `half_life_months` | 8 | Temporal decay half-life |
 | `team_window_months` | 24 | Max age of results for Team Elo |
 | `league_window_months` | 36 | Max age of results for League Elo |
 | `starting_elo` | 1500 | Initial Elo for all teams and leagues |
@@ -333,9 +383,10 @@ League-level rankings are also produced for regional strength comparison.
 
 ---
 
-## 14. Known Limitations and Future Work
+## 16. Known Limitations and Future Work
 
 - **Roster change tracking:** The model does not yet penalize teams for significant roster turnover between the date of a result and today. A future iteration should discount results from lineups that share fewer than 3 players with the current roster.
 - **Player-level Elo:** As Riot themselves noted, integrating individual player ratings would improve predictive accuracy, particularly for newly assembled rosters.
 - **Meta shift weighting:** The model cannot distinguish results across drastically different game patches. A meta-volatility modifier could discount results from epochs where the game played significantly differently.
-- **λ calibration:** The 12-month half-life is a principled starting point, not an empirically optimized value. Backtesting against known tournament outcomes should drive refinement.
+- **λ calibration:** The 8-month half-life default is a principled starting point, not an empirically optimized value. Backtesting against known tournament outcomes should drive refinement. The slider range of 3–24 months allows experimentation.
+- **Worlds main event start dates:** The qualifier/main-event boundary is currently hardcoded per year. This table will need updating each season.

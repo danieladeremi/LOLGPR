@@ -186,7 +186,7 @@
     <div class="panel-title">Model Configuration</div>
     <div class="config-grid">
       <div class="config-item"><label>Team Elo Weight (alpha)</label><input type="range" id="cfg-alpha" min="0.5" max="0.95" step="0.05" value="0.80"><div class="val" id="val-alpha">0.80</div></div>
-      <div class="config-item"><label>Decay Half-Life (months)</label><input type="range" id="cfg-halflife" min="3" max="24" step="1" value="12"><div class="val" id="val-halflife">12 mo</div></div>
+      <div class="config-item"><label>Decay Half-Life (months)</label><input type="range" id="cfg-halflife" min="3" max="24" step="1" value="8"><div class="val" id="val-halflife">8 mo</div></div>
       <div class="config-item"><label>Team Elo Window (months)</label><input type="range" id="cfg-teamwin" min="12" max="36" step="3" value="24"><div class="val" id="val-teamwin">24 mo</div></div>
       <div class="config-item"><label>League Elo Window (months)</label><input type="range" id="cfg-leaguewin" min="18" max="48" step="3" value="36"><div class="val" id="val-leaguewin">36 mo</div></div>
       <div class="config-item"><label>Min Games to Rank</label><input type="range" id="cfg-mingames" min="1" max="20" step="1" value="5"><div class="val" id="val-mingames">5</div></div>
@@ -473,7 +473,7 @@ LEAGUE_CANON={
   'cblol':'CBLoL','cblol-a':'CBLoL',
   'worlds':'Worlds','world championship':'Worlds','wlds':'Worlds','lol worlds':'Worlds',
   'msi':'MSI','mid-season invitational':'MSI','mid season invitational':'MSI','lol msi':'MSI',
-  'first stand':'First Stand','1st stand':'First Stand',
+  'first stand':'First Stand','1st stand':'First Stand','fst':'First Stand',
   'nlc':'TIER2','emea masters':'TIER2','em':'TIER2','lfl':'TIER2',
   'pg nationals':'TIER2','ultraliga':'TIER2','lck cl':'TIER2','lck challengers':'TIER2',
   'ldl':'TIER2','tcl':'TIER2','vcs':'TIER2','ljl':'TIER2','ljl-japan':'TIER2',
@@ -482,6 +482,10 @@ LEAGUE_CANON={
 }
 ALLOWED={'LCK','LPL','LEC','LCP','LCS','CBLoL'}
 INTL={'Worlds','MSI','First Stand'}
+WORLDS_MAIN_START={
+  2024:pd.Timestamp('2024-09-25'),
+  2025:pd.Timestamp('2025-10-15'),
+}
 
 def canon(raw):
   s=str(raw).lower().strip()
@@ -496,6 +500,7 @@ def canon(raw):
   # Substring fallback — handles "LoL Worlds 2024", "MSI 2025", etc.
   if 'world' in s: return 'Worlds'
   if 'msi' in s: return 'MSI'
+  if re.search(r'\\bfst\\b',s): return 'First Stand'
   if 'first stand' in s or '1st stand' in s: return 'First Stand'
   if re.search(r'\\blck\\b',s): return 'LCK'
   if re.search(r'\\blpl\\b',s): return 'LPL'
@@ -521,6 +526,12 @@ def kb(t,po,lg):
 
 def dec(t,hl): return math.exp(-math.log(2)/max(hl,0.1)*t)
 def ex(a,b):   return 1.0/(1.0+math.pow(10.0,-(a-b)/400.0))
+
+def is_worlds_main_event(dt):
+  y=int(dt.year)
+  st=WORLDS_MAIN_START.get(y)
+  if st is None: return True
+  return dt>=st
 
 # ── Load & filter CSVs ──
 dfs=[]
@@ -661,6 +672,8 @@ intl_finals={}
 for idx,s in enumerate(sorted(series_list,key=lambda x:(x['dt'],x['n_games']))):
   if s['lc'] not in INTL or not s['complete']:
     continue
+  if s['lc']=='Worlds' and not is_worlds_main_event(s['dt']):
+    continue
   ek=(s['lc'],s['year'])
   stamp=(s['dt'],idx)
   if ek not in intl_finals or stamp>intl_finals[ek]['stamp']:
@@ -671,8 +684,9 @@ te={};le={};tg={};tl={}
 # tr[team][split_label] = [series_w, series_l, game_w, game_l]
 tr=defaultdict(lambda:defaultdict(lambda:[0,0,0,0]))
 trs={}  # team -> most recent split label
-# intl_ev[team][(lc,yr)] = {series_w,series_l,game_w,game_l}
-intl_ev=defaultdict(lambda:defaultdict(lambda:{'sw':0,'sl':0,'gw':0,'gl':0}))
+# intl_ev[team][(lc,yr)] = {series_w,series_l,game_w,game_l,playoff_series_wins}
+# psw = playoff series wins (playoffs=1 only) — used for placement estimation
+intl_ev=defaultdict(lambda:defaultdict(lambda:{'sw':0,'sl':0,'gw':0,'gl':0,'psw':0}))
 upsets=[]
 
 def gte(t):
@@ -698,8 +712,13 @@ for s in series_list:
   lc=s['lc'];po=s['po'];ma=s['ma'];row0=s['row0']
   wA,wB=s['wA'],s['wB']
   rA_s=(wA/max(1,s['n_games']))
+  dt_row=pd.to_datetime(row0['date'])
+  worlds_qual=(lc=='Worlds' and not is_worlds_main_event(dt_row))
+  is_intl_main=(lc in INTL and not worlds_qual)
 
   sk_label, yv = get_split_label(row0, lc)
+  if worlds_qual:
+    sk_label=f"{yv} Regional Qualifier"
 
   if lc in ALLOWED:
     tl[tA]=lc;tl[tB]=lc
@@ -707,12 +726,17 @@ for s in series_list:
   if ma<=cfg_team_window:
     eA,eB=gte(tA),gte(tB)
     weA=ex(eA,eB)
-    kb_=kb(tier(lc),po,lc)
+    tier_code=tier(lc)
+    k_lg=lc
+    if worlds_qual:
+      tier_code='regional'
+      k_lg=tl.get(tA) if tl.get(tA) in ALLOWED else (tl.get(tB) if tl.get(tB) in ALLOWED else 'LCK')
+    kb_=kb(tier_code,po,k_lg)
     ke=kb_*dec(ma,cfg_half_life)
     wp_winner=weA if tA==winner else(1.0-weA)
 
     if s['complete'] and wp_winner<0.45:
-      upsets.append({'winner':winner,'loser':loser,'win_prob':round(wp_winner,3),'magnitude':round(1-wp_winner,3),'tournament':lc,'date':str(row0['date'])[:10],'is_intl':lc in INTL,'is_playoff':po,'score':s['score'],'n_games':s['n_games']})
+      upsets.append({'winner':winner,'loser':loser,'win_prob':round(wp_winner,3),'magnitude':round(1-wp_winner,3),'tournament':lc,'date':str(row0['date'])[:10],'is_intl':is_intl_main,'is_playoff':po,'score':s['score'],'n_games':s['n_games']})
 
     te[tA]=eA+ke*(rA_s-weA)
     te[tB]=eB+ke*((1-rA_s)-(1-weA))
@@ -728,16 +752,17 @@ for s in series_list:
       if team not in trs or sk_label>trs[team]:
         trs[team]=sk_label
 
-    if lc in INTL:
+    if is_intl_main:
       ek=(lc,yv)
       for team,is_w,gw,gl in[(tA,tA==winner,wA,wB),(tB,tB==winner,wB,wA)]:
         ev=intl_ev[team][ek]
         if s['complete']:
           if is_w: ev['sw']+=1
           else:    ev['sl']+=1
+          if po and is_w: ev['psw']+=1
         ev['gw']+=gw;ev['gl']+=gl
 
-  if lc in INTL and ma<=cfg_league_window:
+  if is_intl_main and ma<=cfg_league_window:
     la=tl.get(tA);lb=tl.get(tB)
     if la and lb and la!=lb:
       kl=kb(tier(lc),po,'LCK')*dec(ma,cfg_half_life)*0.5
@@ -746,17 +771,18 @@ for s in series_list:
       le[la]=ela+kl*(rA_s-wla)
       le[lb]=elb+kl*((1-rA_s)-(1-wla))
 
-def estimate_placement(team,ev_lc,ev_yr,sw,sl):
+def estimate_placement(team,ev_lc,ev_yr,sw,sl,psw):
   ek=(ev_lc,ev_yr)
   fin=intl_finals.get(ek)
   if fin:
     if team==fin['winner']: return 'Champion'
-    if team==fin['loser']: return 'Runner-Up'
+    if team==fin['loser']:  return 'Runner-Up'
   if sw+sl>0: return 'Participant'
   return None
 
 beta=1.0-cfg_alpha
 results=[];all_lg=set();td={}
+
 
 for team,t_elo in te.items():
   games=tg.get(team,0)
@@ -772,8 +798,8 @@ for team,t_elo in te.items():
 
   ie_list=[]
   for (ev_lc,ev_yr),ev in sorted(intl_ev[team].items(),key=lambda x:x[0][1],reverse=True):
-    p=estimate_placement(team,ev_lc,ev_yr,ev['sw'],ev['sl'])
-    ie_list.append({'event':f"{ev_yr} {ev_lc}",'lc':ev_lc,'year':ev_yr,'sw':ev['sw'],'sl':ev['sl'],'gw':ev['gw'],'gl':ev['gl'],'placement':p})
+    p=estimate_placement(team,ev_lc,ev_yr,ev['sw'],ev['sl'],ev['psw'])
+    ie_list.append({'event':f"{ev_yr} {ev_lc}",'lc':ev_lc,'year':ev_yr,'sw':ev['sw'],'sl':ev['sl'],'gw':ev['gw'],'gl':ev['gl'],'psw':ev['psw'],'placement':p})
 
   dom=[]
   for sk_l,rec2 in sorted(tr[team].items(),key=lambda x:x[0],reverse=True):
@@ -911,7 +937,6 @@ function placementCSS(p){
   if(!p)return'p-other';
   if(p==='Champion')return'p-champion';
   if(p==='Runner-Up')return'p-runner';
-  if(p==='3rd / 4th')return'p-34';
   return'p-other';
 }
 function intlTierBadge(lc){
@@ -993,14 +1018,3 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 </script>
 </body>
 </html>
-
-
-
-
-
-
-
-
-
-
-
